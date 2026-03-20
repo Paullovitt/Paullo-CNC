@@ -5,6 +5,13 @@ import { STLLoader } from "three/addons/loaders/STLLoader.js";
 
 // DXF parser (CDN)
 import DxfParser from "https://esm.sh/dxf-parser@1.1.2";
+import {
+  DEFAULT_SHEET_CONFIG,
+  normalizeSheetConfig,
+  buildSheetOrigins,
+  getSheetUsableBounds,
+  findPlacementOnSheet
+} from "./sheet-layout.js";
 
 // ---------------------------
 // Scene / camera / renderer
@@ -15,7 +22,7 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b0f14);
 
 const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 500000);
-camera.position.set(180, 160, 180);
+camera.position.set(2100, 1300, 2300);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
@@ -28,11 +35,11 @@ dir.position.set(200, 300, 150);
 scene.add(dir);
 
 // Grid / axes
-const grid = new THREE.GridHelper(500, 50, 0x334155, 0x1f2937);
+const grid = new THREE.GridHelper(14000, 140, 0x334155, 0x1f2937);
 grid.position.y = 0;
 scene.add(grid);
 
-const axes = new THREE.AxesHelper(80);
+const axes = new THREE.AxesHelper(180);
 scene.add(axes);
 
 // Orbit controls
@@ -49,17 +56,19 @@ scene.add(transformControls);
 // ---------------------------
 // Parts state
 // ---------------------------
+const sheetsGroup = new THREE.Group();
+scene.add(sheetsGroup);
+
 const partsGroup = new THREE.Group();
 scene.add(partsGroup);
 
 const bboxAll = new THREE.Box3();
 const tempBox = new THREE.Box3();
 const tempVec = new THREE.Vector3();
+const sheetTempBox = new THREE.Box3();
 
 const raycaster = new THREE.Raycaster();
 const pointerNdc = new THREE.Vector2();
-const layoutProbeBox = new THREE.Box3();
-const layoutChildBox = new THREE.Box3();
 
 let selectedPart = null;
 let selectionOutline = null;
@@ -67,19 +76,35 @@ let pointerDownX = 0;
 let pointerDownY = 0;
 let pointerMoved = false;
 
-const LAYOUT_CELL_XY = 30;
-const LAYOUT_CELL_Z = 26;
-const LAYOUT_COLUMNS = 5;
-const LAYOUT_ROWS_PER_LAYER = 2;
-const LAYOUT_LAYER_SIZE = LAYOUT_COLUMNS * LAYOUT_ROWS_PER_LAYER;
-const LAYOUT_COLLISION_MARGIN = 1;
-const LAYOUT_PUSH_STEP = 18;
+const SHEET_GAP = 260;
+const SHEET_PART_ELEVATION = 2.4;
+const SHEET_PART_Z_CLAMP = 16;
+const SHEET_ACTIVE_EMISSIVE = 0x0ea5e9;
+const DEFAULT_PART_THICKNESS = 5;
+const DEFAULT_AUTO_CENTER = true;
 const EPS = 1e-6;
 const CPU_CORES = Math.max(1, Number(navigator.hardwareConcurrency || 1));
 const DXF_PARSE_WORKERS = Math.max(1, CPU_CORES);
-const DXF_IMPORT_CONCURRENCY = Math.max(1, CPU_CORES);
+const DXF_CACHE_DB_NAME = "dxf-3d-viewer-cache";
+const DXF_PARSE_CACHE_STORE_NAME = "parsed-contours";
+const DXF_MESH_CACHE_STORE_NAME = "mesh-groups";
+const DXF_CACHE_SCHEMA_VERSION = 2;
+const DXF_PARSE_CACHE_PIPELINE_VERSION = "browser-parse-v1";
+const DXF_MESH_CACHE_PIPELINE_VERSION = "browser-mesh-v1";
+const DXF_PARSE_CACHE_MAX_ENTRIES = 120;
+const DXF_PARSE_CACHE_MAX_BYTES = 80 * 1024 * 1024;
+const DXF_MESH_CACHE_MAX_ENTRIES = 32;
+const DXF_MESH_CACHE_MAX_BYTES = 280 * 1024 * 1024;
+const STEP_MESH_CACHE_PIPELINE_VERSION = "step-mesh-v1";
+const DXF_PARSE_TIMEOUT_MS = 90000;
 const STEP_PARSE_TIMEOUT_MS = 60000;
+const DXF_CACHE_STORE_NAME = DXF_PARSE_CACHE_STORE_NAME;
+const DXF_CACHE_PIPELINE_VERSION = DXF_PARSE_CACHE_PIPELINE_VERSION;
+const DXF_CACHE_MAX_ENTRIES = DXF_PARSE_CACHE_MAX_ENTRIES;
+const DXF_CACHE_MAX_BYTES = DXF_PARSE_CACHE_MAX_BYTES;
 let dxfWorkerPool = null;
+let dxfCacheDbPromise = null;
+let dxfCacheInitLogged = false;
 
 function createDxfWorkerPool(workerCount) {
   if (typeof Worker === "undefined") return null;
@@ -210,6 +235,545 @@ async function parseDxfWithWorkers(dxfText, filename = "") {
   }
 }
 
+function idbRequestToPromise(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("IndexedDB request failed"));
+  });
+}
+
+function waitForTransaction(tx) {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(tx.error || new Error("IndexedDB transaction aborted"));
+    tx.onerror = () => reject(tx.error || new Error("IndexedDB transaction failed"));
+  });
+}
+
+function supportsPersistentDxfCache() {
+  return typeof indexedDB !== "undefined";
+}
+
+function ensureObjectStore(db, name) {
+  if (db.objectStoreNames.contains(name)) return null;
+  const store = db.createObjectStore(name, { keyPath: "key" });
+  store.createIndex("updatedAt", "updatedAt", { unique: false });
+  return store;
+}
+
+async function openDxfCacheDb() {
+  if (!supportsPersistentDxfCache()) return null;
+  if (dxfCacheDbPromise) return dxfCacheDbPromise;
+
+  dxfCacheDbPromise = new Promise((resolve) => {
+    try {
+      const request = indexedDB.open(DXF_CACHE_DB_NAME, DXF_CACHE_SCHEMA_VERSION);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        ensureObjectStore(db, DXF_PARSE_CACHE_STORE_NAME);
+        ensureObjectStore(db, DXF_MESH_CACHE_STORE_NAME);
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => resolve(null);
+      request.onblocked = () => resolve(null);
+    } catch (_error) {
+      resolve(null);
+    }
+  });
+
+  return dxfCacheDbPromise;
+}
+
+function estimateJsonSizeBytes(value) {
+  try {
+    return new Blob([JSON.stringify(value)]).size;
+  } catch (_error) {
+    return 0;
+  }
+}
+
+async function computeArrayBufferHashHex(arrayBuffer) {
+  const subtle = globalThis.crypto?.subtle;
+  if (subtle && typeof subtle.digest === "function") {
+    const digest = await subtle.digest("SHA-256", arrayBuffer);
+    const bytes = new Uint8Array(digest);
+    let hex = "";
+    for (const b of bytes) hex += b.toString(16).padStart(2, "0");
+    return hex;
+  }
+
+  // Fallback deterministic hash when SubtleCrypto is unavailable.
+  const bytes = new Uint8Array(arrayBuffer);
+  let hash = 2166136261;
+  for (let i = 0; i < bytes.length; i += 1) {
+    hash ^= bytes[i];
+    hash = Math.imul(hash, 16777619);
+  }
+  return `fnv1a_${(hash >>> 0).toString(16)}_${bytes.length}`;
+}
+
+function buildParsedCacheKeyFromHash(hash) {
+  if (!hash) return "";
+  return `${DXF_CACHE_PIPELINE_VERSION}:${hash}`;
+}
+
+function buildMeshCacheKeyFromHash(hash, thickness) {
+  if (!hash) return "";
+  return `${DXF_MESH_CACHE_PIPELINE_VERSION}:${hash}:t=${Number(thickness)}`;
+}
+
+function buildStepMeshCacheKeyFromHash(hash) {
+  if (!hash) return "";
+  return `${STEP_MESH_CACHE_PIPELINE_VERSION}:${hash}`;
+}
+
+async function buildParsedCacheKey(arrayBuffer) {
+  const hash = await computeArrayBufferHashHex(arrayBuffer);
+  return buildParsedCacheKeyFromHash(hash);
+}
+
+function isValidParsedPayload(parsed) {
+  if (!parsed || typeof parsed !== "object") return false;
+  if (!Array.isArray(parsed.contours)) return false;
+  if (!Number.isFinite(Number(parsed.width))) return false;
+  if (!Number.isFinite(Number(parsed.height))) return false;
+  return true;
+}
+
+async function getParsedFromPersistentCache(cacheKey) {
+  if (!cacheKey) return null;
+  const db = await openDxfCacheDb();
+  if (!db) return null;
+
+  try {
+    const tx = db.transaction(DXF_CACHE_STORE_NAME, "readonly");
+    const store = tx.objectStore(DXF_CACHE_STORE_NAME);
+    const record = await idbRequestToPromise(store.get(cacheKey));
+    await waitForTransaction(tx);
+    if (!record || !isValidParsedPayload(record.parsed)) return null;
+
+    // Async touch to keep recent entries alive.
+    try {
+      const writeTx = db.transaction(DXF_CACHE_STORE_NAME, "readwrite");
+      const writeStore = writeTx.objectStore(DXF_CACHE_STORE_NAME);
+      writeStore.put({
+        ...record,
+        hits: Number(record.hits || 0) + 1,
+        updatedAt: Date.now()
+      });
+    } catch (_touchError) {
+      // no-op
+    }
+
+    return record.parsed;
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function trimPersistentParsedCache(db) {
+  try {
+    const tx = db.transaction(DXF_CACHE_STORE_NAME, "readonly");
+    const store = tx.objectStore(DXF_CACHE_STORE_NAME);
+    const all = await idbRequestToPromise(store.getAll());
+    await waitForTransaction(tx);
+    if (!Array.isArray(all) || all.length === 0) return;
+
+    const sorted = all
+      .slice()
+      .sort((a, b) => Number(b?.updatedAt || 0) - Number(a?.updatedAt || 0));
+
+    const keysToDelete = new Set();
+    if (sorted.length > DXF_CACHE_MAX_ENTRIES) {
+      for (const rec of sorted.slice(DXF_CACHE_MAX_ENTRIES)) {
+        if (rec?.key) keysToDelete.add(rec.key);
+      }
+    }
+
+    let totalBytes = 0;
+    for (const rec of sorted) totalBytes += Number(rec?.approxBytes || 0);
+
+    if (totalBytes > DXF_CACHE_MAX_BYTES) {
+      for (let i = sorted.length - 1; i >= 0 && totalBytes > DXF_CACHE_MAX_BYTES; i -= 1) {
+        const rec = sorted[i];
+        if (!rec?.key || keysToDelete.has(rec.key)) continue;
+        keysToDelete.add(rec.key);
+        totalBytes -= Number(rec?.approxBytes || 0);
+      }
+    }
+
+    if (keysToDelete.size === 0) return;
+
+    const writeTx = db.transaction(DXF_CACHE_STORE_NAME, "readwrite");
+    const writeStore = writeTx.objectStore(DXF_CACHE_STORE_NAME);
+    for (const key of keysToDelete) writeStore.delete(key);
+    await waitForTransaction(writeTx);
+  } catch (_error) {
+    // no-op
+  }
+}
+
+async function putParsedInPersistentCache(cacheKey, parsed, file) {
+  if (!cacheKey || !isValidParsedPayload(parsed)) return false;
+  const db = await openDxfCacheDb();
+  if (!db) return false;
+
+  const now = Date.now();
+  const approxBytes = estimateJsonSizeBytes(parsed);
+  const record = {
+    key: cacheKey,
+    parsed,
+    approxBytes,
+    fileName: String(file?.name || ""),
+    fileSize: Number(file?.size || 0),
+    createdAt: now,
+    updatedAt: now,
+    hits: 0
+  };
+
+  try {
+    const tx = db.transaction(DXF_CACHE_STORE_NAME, "readwrite");
+    const store = tx.objectStore(DXF_CACHE_STORE_NAME);
+    store.put(record);
+    await waitForTransaction(tx);
+    await trimPersistentParsedCache(db);
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function typedArrayFromCtorName(ctorName, sourceArray) {
+  switch (String(ctorName || "")) {
+    case "Float32Array": return new Float32Array(sourceArray);
+    case "Float64Array": return new Float64Array(sourceArray);
+    case "Int8Array": return new Int8Array(sourceArray);
+    case "Uint8Array": return new Uint8Array(sourceArray);
+    case "Uint8ClampedArray": return new Uint8ClampedArray(sourceArray);
+    case "Int16Array": return new Int16Array(sourceArray);
+    case "Uint16Array": return new Uint16Array(sourceArray);
+    case "Int32Array": return new Int32Array(sourceArray);
+    case "Uint32Array": return new Uint32Array(sourceArray);
+    default:
+      return null;
+  }
+}
+
+function cloneTypedArray(value) {
+  if (!value || typeof value.length !== "number") return null;
+  const ctorName = value.constructor?.name;
+  return typedArrayFromCtorName(ctorName, value);
+}
+
+function serializeBufferAttribute(attr) {
+  if (!attr || !attr.array) return null;
+  const arr = cloneTypedArray(attr.array);
+  if (!arr) return null;
+  return {
+    itemSize: Number(attr.itemSize || 0),
+    normalized: !!attr.normalized,
+    ctor: arr.constructor.name,
+    array: arr
+  };
+}
+
+function deserializeBufferAttribute(raw) {
+  if (!raw || !raw.array) return null;
+  const arr = typedArrayFromCtorName(raw.ctor, raw.array);
+  if (!arr || !Number.isFinite(Number(raw.itemSize)) || Number(raw.itemSize) < 1) return null;
+  return new THREE.BufferAttribute(arr, Number(raw.itemSize), !!raw.normalized);
+}
+
+function estimateTypedArrayBytes(value) {
+  if (!value || typeof value.byteLength !== "number") return 0;
+  return Number(value.byteLength || 0);
+}
+
+function serializeBufferGeometry(geometry) {
+  if (!geometry || !geometry.isBufferGeometry) return null;
+
+  const attributes = {};
+  for (const [name, attr] of Object.entries(geometry.attributes || {})) {
+    const serialized = serializeBufferAttribute(attr);
+    if (serialized) attributes[name] = serialized;
+  }
+
+  const index = geometry.index ? serializeBufferAttribute(geometry.index) : null;
+  const groups = Array.isArray(geometry.groups)
+    ? geometry.groups.map((g) => ({
+      start: Number(g.start || 0),
+      count: Number(g.count || 0),
+      materialIndex: Number(g.materialIndex || 0)
+    }))
+    : [];
+
+  return {
+    attributes,
+    index,
+    groups
+  };
+}
+
+function deserializeBufferGeometry(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return null;
+  const geometry = new THREE.BufferGeometry();
+
+  for (const [name, rawAttr] of Object.entries(snapshot.attributes || {})) {
+    const attr = deserializeBufferAttribute(rawAttr);
+    if (attr) geometry.setAttribute(name, attr);
+  }
+
+  if (snapshot.index) {
+    const indexAttr = deserializeBufferAttribute(snapshot.index);
+    if (indexAttr) geometry.setIndex(indexAttr);
+  }
+
+  if (Array.isArray(snapshot.groups) && snapshot.groups.length > 0) {
+    geometry.clearGroups();
+    for (const g of snapshot.groups) {
+      geometry.addGroup(
+        Number(g?.start || 0),
+        Number(g?.count || 0),
+        Number(g?.materialIndex || 0)
+      );
+    }
+  }
+
+  geometry.computeBoundingBox();
+  geometry.computeBoundingSphere();
+  return geometry;
+}
+
+function serializeMeshMaterial(material) {
+  const mat = Array.isArray(material) ? material[0] : material;
+  if (!mat) return null;
+  const colorHex = mat.color ? mat.color.getHex() : 0x8b5cf6;
+  return {
+    color: Number(colorHex),
+    metalness: Number(mat.metalness ?? 0.05),
+    roughness: Number(mat.roughness ?? 0.85),
+    opacity: Number(mat.opacity ?? 1),
+    transparent: !!mat.transparent,
+    side: Number(mat.side ?? THREE.FrontSide)
+  };
+}
+
+function deserializeMeshMaterial(snapshot) {
+  const data = snapshot || {};
+  return new THREE.MeshStandardMaterial({
+    color: Number(data.color ?? 0x8b5cf6),
+    metalness: Number(data.metalness ?? 0.05),
+    roughness: Number(data.roughness ?? 0.85),
+    opacity: Number(data.opacity ?? 1),
+    transparent: !!data.transparent,
+    side: Number(data.side ?? THREE.FrontSide)
+  });
+}
+
+function serializeSelectionPrimaryLoop(loop) {
+  if (!Array.isArray(loop) || loop.length < 3) return null;
+  const out = [];
+  for (const p of loop) {
+    const x = Number(p?.x);
+    const y = Number(p?.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    out.push([x, y]);
+  }
+  return out.length >= 3 ? out : null;
+}
+
+function deserializeSelectionPrimaryLoop(rawLoop) {
+  if (!Array.isArray(rawLoop) || rawLoop.length < 3) return null;
+  const out = [];
+  for (const p of rawLoop) {
+    const x = Number(Array.isArray(p) ? p[0] : p?.x);
+    const y = Number(Array.isArray(p) ? p[1] : p?.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    out.push(new THREE.Vector2(x, y));
+  }
+  return out.length >= 3 ? out : null;
+}
+
+function serializeMeshGroupSnapshot(localGroup, thickness) {
+  if (!localGroup || !localGroup.isObject3D) return null;
+  localGroup.updateMatrixWorld(true);
+
+  const meshes = [];
+  localGroup.traverse((node) => {
+    if (!node?.isMesh || !node.geometry) return;
+    const geometry = serializeBufferGeometry(node.geometry);
+    if (!geometry) return;
+    const material = serializeMeshMaterial(node.material);
+
+    meshes.push({
+      name: String(node.name || ""),
+      geometry,
+      material,
+      position: [node.position.x, node.position.y, node.position.z],
+      quaternion: [node.quaternion.x, node.quaternion.y, node.quaternion.z, node.quaternion.w],
+      scale: [node.scale.x, node.scale.y, node.scale.z]
+    });
+  });
+
+  if (meshes.length === 0) return null;
+
+  return {
+    thickness: Number(thickness),
+    selectionPrimaryLoop: serializeSelectionPrimaryLoop(localGroup.userData?.selectionPrimaryLoop),
+    meshes
+  };
+}
+
+function estimateMeshSnapshotBytes(snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.meshes)) return 0;
+  let total = 0;
+  for (const mesh of snapshot.meshes) {
+    const index = mesh?.geometry?.index;
+    if (index?.array) total += estimateTypedArrayBytes(index.array);
+    for (const attr of Object.values(mesh?.geometry?.attributes || {})) {
+      if (attr?.array) total += estimateTypedArrayBytes(attr.array);
+    }
+    total += 256;
+  }
+  return total;
+}
+
+function buildGroupFromMeshSnapshot(snapshot, fallbackName = "") {
+  if (!snapshot || !Array.isArray(snapshot.meshes) || snapshot.meshes.length === 0) return null;
+
+  const group = new THREE.Group();
+  group.name = String(fallbackName || "arquivo.dxf");
+
+  const selLoop = deserializeSelectionPrimaryLoop(snapshot.selectionPrimaryLoop);
+  if (selLoop) group.userData.selectionPrimaryLoop = selLoop;
+
+  for (const meshData of snapshot.meshes) {
+    const geometry = deserializeBufferGeometry(meshData.geometry);
+    if (!geometry) continue;
+    const material = deserializeMeshMaterial(meshData.material);
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.name = String(meshData?.name || "");
+
+    const pos = Array.isArray(meshData?.position) ? meshData.position : [];
+    const quat = Array.isArray(meshData?.quaternion) ? meshData.quaternion : [];
+    const scale = Array.isArray(meshData?.scale) ? meshData.scale : [];
+    if (pos.length === 3) mesh.position.set(Number(pos[0]), Number(pos[1]), Number(pos[2]));
+    if (quat.length === 4) mesh.quaternion.set(Number(quat[0]), Number(quat[1]), Number(quat[2]), Number(quat[3]));
+    if (scale.length === 3) mesh.scale.set(Number(scale[0]), Number(scale[1]), Number(scale[2]));
+
+    group.add(mesh);
+  }
+
+  return group.children.length > 0 ? group : null;
+}
+
+async function trimPersistentMeshCache(db) {
+  try {
+    const tx = db.transaction(DXF_MESH_CACHE_STORE_NAME, "readonly");
+    const store = tx.objectStore(DXF_MESH_CACHE_STORE_NAME);
+    const all = await idbRequestToPromise(store.getAll());
+    await waitForTransaction(tx);
+    if (!Array.isArray(all) || all.length === 0) return;
+
+    const sorted = all
+      .slice()
+      .sort((a, b) => Number(b?.updatedAt || 0) - Number(a?.updatedAt || 0));
+
+    const keysToDelete = new Set();
+    if (sorted.length > DXF_MESH_CACHE_MAX_ENTRIES) {
+      for (const rec of sorted.slice(DXF_MESH_CACHE_MAX_ENTRIES)) {
+        if (rec?.key) keysToDelete.add(rec.key);
+      }
+    }
+
+    let totalBytes = 0;
+    for (const rec of sorted) totalBytes += Number(rec?.approxBytes || 0);
+    if (totalBytes > DXF_MESH_CACHE_MAX_BYTES) {
+      for (let i = sorted.length - 1; i >= 0 && totalBytes > DXF_MESH_CACHE_MAX_BYTES; i -= 1) {
+        const rec = sorted[i];
+        if (!rec?.key || keysToDelete.has(rec.key)) continue;
+        keysToDelete.add(rec.key);
+        totalBytes -= Number(rec?.approxBytes || 0);
+      }
+    }
+
+    if (keysToDelete.size === 0) return;
+
+    const writeTx = db.transaction(DXF_MESH_CACHE_STORE_NAME, "readwrite");
+    const writeStore = writeTx.objectStore(DXF_MESH_CACHE_STORE_NAME);
+    for (const key of keysToDelete) writeStore.delete(key);
+    await waitForTransaction(writeTx);
+  } catch (_error) {
+    // no-op
+  }
+}
+
+async function getMeshGroupFromPersistentCache(cacheKey, fallbackName = "") {
+  if (!cacheKey) return null;
+  const db = await openDxfCacheDb();
+  if (!db) return null;
+
+  try {
+    const tx = db.transaction(DXF_MESH_CACHE_STORE_NAME, "readonly");
+    const store = tx.objectStore(DXF_MESH_CACHE_STORE_NAME);
+    const record = await idbRequestToPromise(store.get(cacheKey));
+    await waitForTransaction(tx);
+    if (!record?.snapshot) return null;
+
+    const group = buildGroupFromMeshSnapshot(record.snapshot, fallbackName || record.fileName || "");
+    if (!group) return null;
+
+    try {
+      const writeTx = db.transaction(DXF_MESH_CACHE_STORE_NAME, "readwrite");
+      const writeStore = writeTx.objectStore(DXF_MESH_CACHE_STORE_NAME);
+      writeStore.put({
+        ...record,
+        hits: Number(record.hits || 0) + 1,
+        updatedAt: Date.now()
+      });
+    } catch (_touchError) {
+      // no-op
+    }
+
+    return group;
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function putMeshGroupInPersistentCache(cacheKey, localGroup, file, thickness) {
+  if (!cacheKey || !localGroup) return false;
+  const db = await openDxfCacheDb();
+  if (!db) return false;
+
+  const snapshot = serializeMeshGroupSnapshot(localGroup, thickness);
+  if (!snapshot) return false;
+
+  const now = Date.now();
+  const record = {
+    key: cacheKey,
+    snapshot,
+    approxBytes: estimateMeshSnapshotBytes(snapshot),
+    fileName: String(file?.name || ""),
+    fileSize: Number(file?.size || 0),
+    thickness: Number(thickness),
+    createdAt: now,
+    updatedAt: now,
+    hits: 0
+  };
+
+  try {
+    const tx = db.transaction(DXF_MESH_CACHE_STORE_NAME, "readwrite");
+    const store = tx.objectStore(DXF_MESH_CACHE_STORE_NAME);
+    store.put(record);
+    await waitForTransaction(tx);
+    await trimPersistentMeshCache(db);
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
 function cachePartBounds(part) {
   if (!part) return null;
   part.updateMatrixWorld(true);
@@ -228,65 +792,296 @@ function getCachedPartBounds(part) {
   return cachePartBounds(part);
 }
 
-function refreshAllPartBounds() {
-  for (const child of partsGroup.children) cachePartBounds(child);
+const sheetState = [];
+let activeSheetIndex = 0;
+
+function getValidSheetIndex(index) {
+  const numeric = Number(index);
+  if (!Number.isFinite(numeric)) return -1;
+  const parsed = Math.trunc(numeric);
+  if (parsed < 0 || parsed >= sheetState.length) return -1;
+  return parsed;
 }
 
-function alternatingOffset(index) {
-  if (index === 0) return 0;
-  const step = Math.ceil(index / 2);
-  return index % 2 === 1 ? step : -step;
+function cloneSheetConfig(config) {
+  return { ...normalizeSheetConfig(config, DEFAULT_SHEET_CONFIG), originX: 0, originY: 0 };
 }
 
-function getUpperSquareSlot(index) {
-  const layer = Math.floor(index / LAYOUT_LAYER_SIZE);
-  const localIndex = index % LAYOUT_LAYER_SIZE;
-  const row = Math.floor(localIndex / LAYOUT_COLUMNS);
-  const colIndex = localIndex % LAYOUT_COLUMNS;
-
-  return {
-    x: alternatingOffset(colIndex),
-    y: row,
-    z: -layer
-  };
+function createSheetFrom(config = null) {
+  const source = config || DEFAULT_SHEET_CONFIG;
+  return cloneSheetConfig(source);
 }
 
-function placeGroupInLayout(localGroup, index) {
-  const slot = getUpperSquareSlot(index);
-  localGroup.position.x += slot.x * LAYOUT_CELL_XY;
-  localGroup.position.y += slot.y * LAYOUT_CELL_XY;
-  localGroup.position.z += slot.z * LAYOUT_CELL_Z;
-
-  const pushDir = new THREE.Vector3(
-    slot.x === 0 ? 0 : Math.sign(slot.x),
-    slot.y === 0 ? 1 : Math.sign(slot.y),
-    slot.z < 0 ? -0.35 : 0
-  );
-  if (pushDir.lengthSq() < 1e-9) pushDir.set(1, 1, 0);
-  pushDir.normalize();
-
-  for (let i = 0; i < 160; i++) {
-    localGroup.updateMatrixWorld(true);
-    layoutProbeBox.setFromObject(localGroup);
-    layoutProbeBox.expandByScalar(LAYOUT_COLLISION_MARGIN);
-
-    let collided = false;
-    for (const child of partsGroup.children) {
-      const childBounds = getCachedPartBounds(child);
-      if (!childBounds) continue;
-      layoutChildBox.copy(childBounds);
-      layoutChildBox.expandByScalar(LAYOUT_COLLISION_MARGIN);
-      if (layoutProbeBox.intersectsBox(layoutChildBox)) {
-        collided = true;
-        break;
-      }
-    }
-
-    if (!collided) break;
-
-    localGroup.position.addScaledVector(pushDir, LAYOUT_PUSH_STEP);
-    if ((i + 1) % 30 === 0) localGroup.position.y += LAYOUT_PUSH_STEP;
+function occupiedBoxesForSheet(sheetIndex, exceptPart = null) {
+  const occupied = [];
+  const target = Number(sheetIndex);
+  for (const part of partsGroup.children) {
+    if (!part || part === exceptPart) continue;
+    if (Number(part.userData?.sheetIndex) !== target) continue;
+    const bounds = getCachedPartBounds(part);
+    if (!bounds) continue;
+    occupied.push({
+      minX: bounds.min.x,
+      minY: bounds.min.y,
+      maxX: bounds.max.x,
+      maxY: bounds.max.y
+    });
   }
+  return occupied;
+}
+
+function getPartSizeXY(part) {
+  const bounds = getCachedPartBounds(part);
+  if (!bounds) return null;
+  const width = Math.max(0, Number(bounds.max.x) - Number(bounds.min.x));
+  const height = Math.max(0, Number(bounds.max.y) - Number(bounds.min.y));
+  if (width <= EPS || height <= EPS) return null;
+  return { width, height, bounds };
+}
+
+function clampPartToSheet(part) {
+  if (!part) return false;
+  const sheetIndex = getValidSheetIndex(part.userData?.sheetIndex);
+  if (sheetIndex < 0) return false;
+  const sheet = sheetState[sheetIndex];
+  if (!sheet) return false;
+
+  const size = getPartSizeXY(part);
+  if (!size) return false;
+  const usable = getSheetUsableBounds(sheet, sheet.originX, sheet.originY);
+  if (size.width > usable.width + EPS || size.height > usable.height + EPS) return false;
+
+  const maxStartX = usable.maxX - size.width;
+  const maxStartY = usable.maxY - size.height;
+  const targetMinX = THREE.MathUtils.clamp(size.bounds.min.x, usable.minX, maxStartX);
+  const targetMinY = THREE.MathUtils.clamp(size.bounds.min.y, usable.minY, maxStartY);
+  const dx = targetMinX - size.bounds.min.x;
+  const dy = targetMinY - size.bounds.min.y;
+  if (Math.abs(dx) > EPS || Math.abs(dy) > EPS) {
+    part.position.x += dx;
+    part.position.y += dy;
+  }
+  part.position.z = THREE.MathUtils.clamp(Number(part.position.z || 0), -SHEET_PART_Z_CLAMP, SHEET_PART_Z_CLAMP);
+  cachePartBounds(part);
+  return true;
+}
+
+function tryPlacePartOnSheet(part, sheetIndex) {
+  const idx = getValidSheetIndex(sheetIndex);
+  if (idx < 0 || !part) return false;
+  const sheet = sheetState[idx];
+  if (!sheet) return false;
+  const partSize = getPartSizeXY(part);
+  if (!partSize) return false;
+
+  const usable = getSheetUsableBounds(sheet, sheet.originX, sheet.originY);
+  const placement = findPlacementOnSheet({
+    partWidth: partSize.width,
+    partHeight: partSize.height,
+    usableBounds: usable,
+    occupiedBoxes: occupiedBoxesForSheet(idx, part),
+    spacing: sheet.spacing
+  });
+  if (!placement) return false;
+
+  const dx = Number(placement.x) - Number(partSize.bounds.min.x);
+  const dy = Number(placement.y) - Number(partSize.bounds.min.y);
+  part.position.x += dx;
+  part.position.y += dy;
+  if (Number(part.position.z || 0) < SHEET_PART_ELEVATION) {
+    part.position.z = SHEET_PART_ELEVATION;
+  }
+  part.userData.sheetIndex = idx;
+  cachePartBounds(part);
+  return true;
+}
+
+function syncSheetsOrigins({ preservePartPositions = true } = {}) {
+  const oldOrigins = sheetState.map((sheet) => Number(sheet.originX || 0));
+  const newOrigins = buildSheetOrigins(sheetState, SHEET_GAP);
+  for (let i = 0; i < sheetState.length; i += 1) {
+    sheetState[i].originX = Number(newOrigins[i] || 0);
+    sheetState[i].originY = 0;
+  }
+  if (!preservePartPositions) return;
+
+  for (const part of partsGroup.children) {
+    const sheetIndex = getValidSheetIndex(part.userData?.sheetIndex);
+    if (sheetIndex < 0) continue;
+    const previous = Number(oldOrigins[sheetIndex] || 0);
+    const current = Number(sheetState[sheetIndex]?.originX || 0);
+    const delta = current - previous;
+    if (Math.abs(delta) <= EPS) continue;
+    part.position.x += delta;
+    cachePartBounds(part);
+  }
+}
+
+function clearSheetVisuals() {
+  while (sheetsGroup.children.length) {
+    const child = sheetsGroup.children[0];
+    sheetsGroup.remove(child);
+    disposeObject3D(child);
+  }
+}
+
+function createSheetBorderLine(minX, minY, maxX, maxY, colorHex) {
+  const points = [
+    new THREE.Vector3(minX, minY, 0),
+    new THREE.Vector3(maxX, minY, 0),
+    new THREE.Vector3(maxX, maxY, 0),
+    new THREE.Vector3(minX, maxY, 0),
+    new THREE.Vector3(minX, minY, 0)
+  ];
+  const geometry = new THREE.BufferGeometry().setFromPoints(points);
+  const material = new THREE.LineBasicMaterial({
+    color: colorHex,
+    transparent: true,
+    opacity: 0.95,
+    toneMapped: false
+  });
+  return new THREE.Line(geometry, material);
+}
+
+function rebuildSheetsVisuals() {
+  clearSheetVisuals();
+  for (let idx = 0; idx < sheetState.length; idx += 1) {
+    const sheet = sheetState[idx];
+    if (!sheet) continue;
+
+    const isActive = idx === activeSheetIndex;
+    const centerX = Number(sheet.originX) + Number(sheet.width) * 0.5;
+    const centerY = Number(sheet.originY) + Number(sheet.height) * 0.5;
+    const thickness = Math.max(0.8, Number(sheet.thickness || 1));
+    const plateZ = -thickness * 0.5;
+
+    const wrapper = new THREE.Group();
+    wrapper.name = `sheet-${idx + 1}`;
+
+    const bodyGeo = new THREE.BoxGeometry(Number(sheet.width), Number(sheet.height), thickness);
+    const bodyMat = new THREE.MeshStandardMaterial({
+      color: isActive ? 0x1e293b : 0x19232f,
+      roughness: 0.94,
+      metalness: 0.02,
+      transparent: true,
+      opacity: 0.72,
+      emissive: isActive ? SHEET_ACTIVE_EMISSIVE : 0x000000,
+      emissiveIntensity: isActive ? 0.19 : 0
+    });
+    const bodyMesh = new THREE.Mesh(bodyGeo, bodyMat);
+    bodyMesh.position.set(centerX, centerY, plateZ);
+    bodyMesh.userData.sheetIndex = idx;
+    wrapper.add(bodyMesh);
+
+    const border = createSheetBorderLine(
+      Number(sheet.originX),
+      Number(sheet.originY),
+      Number(sheet.originX) + Number(sheet.width),
+      Number(sheet.originY) + Number(sheet.height),
+      isActive ? 0x38bdf8 : 0x64748b
+    );
+    border.position.z = 0.35;
+    wrapper.add(border);
+
+    const usable = getSheetUsableBounds(sheet, sheet.originX, sheet.originY);
+    const usableBorder = createSheetBorderLine(
+      usable.minX,
+      usable.minY,
+      usable.maxX,
+      usable.maxY,
+      isActive ? 0x22c55e : 0x4b5563
+    );
+    usableBorder.position.z = 0.55;
+    wrapper.add(usableBorder);
+
+    sheetsGroup.add(wrapper);
+  }
+}
+
+function piecesInSheet(sheetIndex) {
+  const idx = Number(sheetIndex);
+  let total = 0;
+  for (const part of partsGroup.children) {
+    if (Number(part.userData?.sheetIndex) === idx) total += 1;
+  }
+  return total;
+}
+
+function relayoutSheetPieces(sheetIndex) {
+  const idx = getValidSheetIndex(sheetIndex);
+  if (idx < 0) return;
+  const parts = partsGroup.children
+    .filter((part) => Number(part.userData?.sheetIndex) === idx)
+    .slice()
+    .sort((a, b) => {
+      const ba = getCachedPartBounds(a);
+      const bb = getCachedPartBounds(b);
+      const areaA = ba ? (ba.max.x - ba.min.x) * (ba.max.y - ba.min.y) : 0;
+      const areaB = bb ? (bb.max.x - bb.min.x) * (bb.max.y - bb.min.y) : 0;
+      return areaB - areaA;
+    });
+
+  for (const part of parts) {
+    if (!tryPlacePartOnSheet(part, idx)) {
+      assignPartToSheet(part, idx, { allowCreateSheet: true, searchAllSheets: true });
+    }
+  }
+}
+
+function assignPartToSheet(
+  part,
+  preferredSheetIndex = activeSheetIndex,
+  { allowCreateSheet = true, searchAllSheets = true } = {}
+) {
+  if (!part) return false;
+  const originalSheet = getValidSheetIndex(part.userData?.sheetIndex);
+  const originalPosition = part.position.clone();
+
+  const target = getValidSheetIndex(preferredSheetIndex);
+  const candidates = [];
+  if (target >= 0) candidates.push(target);
+  if (searchAllSheets) {
+    for (let idx = 0; idx < sheetState.length; idx += 1) {
+      if (!candidates.includes(idx)) candidates.push(idx);
+    }
+  }
+
+  for (const idx of candidates) {
+    if (tryPlacePartOnSheet(part, idx)) return true;
+  }
+
+  if (allowCreateSheet) {
+    const source = sheetState[Math.max(0, target)] || sheetState[sheetState.length - 1] || DEFAULT_SHEET_CONFIG;
+    sheetState.push(createSheetFrom(source));
+    syncSheetsOrigins({ preservePartPositions: true });
+    activeSheetIndex = sheetState.length - 1;
+    rebuildSheetsVisuals();
+    updateSheetListUi();
+    updateSheetInfoBadge();
+
+    if (tryPlacePartOnSheet(part, activeSheetIndex)) return true;
+  }
+
+  part.position.copy(originalPosition);
+  if (originalSheet >= 0) part.userData.sheetIndex = originalSheet;
+  cachePartBounds(part);
+  return false;
+}
+
+function ensureInitialSheet() {
+  if (sheetState.length > 0) return;
+  sheetState.push(createSheetFrom(DEFAULT_SHEET_CONFIG));
+  syncSheetsOrigins({ preservePartPositions: false });
+  rebuildSheetsVisuals();
+}
+
+function setActiveSheet(index) {
+  const idx = getValidSheetIndex(index);
+  if (idx < 0) return;
+  activeSheetIndex = idx;
+  rebuildSheetsVisuals();
+  updateSheetListUi();
+  updateSheetInfoBadge();
 }
 
 function onResize() {
@@ -301,11 +1096,19 @@ onResize();
 
 transformControls.addEventListener("dragging-changed", (event) => {
   controls.enabled = !event.value;
+  if (!event.value && selectedPart) {
+    clampPartToSheet(selectedPart);
+    updateSheetListUi();
+  }
 });
 
 transformControls.addEventListener("objectChange", () => {
-  if (selectedPart) cachePartBounds(selectedPart);
+  if (selectedPart) {
+    cachePartBounds(selectedPart);
+    clampPartToSheet(selectedPart);
+  }
   updateGlobalBounds();
+  updateSheetListUi();
 });
 
 function disposeObject3D(root) {
@@ -347,6 +1150,7 @@ function clearSelection() {
 
   selectedPart = null;
   updateSelectedPieceBadge(null);
+  updateSheetInfoBadge();
 }
 
 function buildSelectionOutline(part) {
@@ -409,6 +1213,12 @@ function setSelectedPart(part) {
   selectedPart = part;
   transformControls.attach(selectedPart);
   updateSelectedPieceBadge(selectedPart.name || "");
+  const partSheetIndex = getValidSheetIndex(selectedPart.userData?.sheetIndex);
+  if (partSheetIndex >= 0 && partSheetIndex !== activeSheetIndex) {
+    setActiveSheet(partSheetIndex);
+  } else {
+    updateSheetInfoBadge();
+  }
 
   selectionOutline = buildSelectionOutline(selectedPart);
   if (selectionOutline) selectedPart.add(selectionOutline);
@@ -478,6 +1288,8 @@ window.addEventListener("keydown", (event) => {
   disposeObject3D(part);
   updateGlobalBounds();
   updatePieceCountBadge();
+  updateSheetListUi();
+  updateSheetInfoBadge();
 });
 
 // ---------------------------
@@ -2586,14 +3398,26 @@ function shouldReparseInRawLineArcMode(parsed) {
 }
 
 function finalizeImportedGroup(localGroup, autoCenter) {
+  ensureInitialSheet();
   localGroup.updateMatrixWorld(true);
   tempBox.setFromObject(localGroup);
   if (autoCenter) {
     tempBox.getCenter(tempVec);
     localGroup.position.sub(tempVec);
   }
-  placeGroupInLayout(localGroup, partsGroup.children.length);
+  if (Number(localGroup.position.z || 0) < SHEET_PART_ELEVATION) {
+    localGroup.position.z = SHEET_PART_ELEVATION;
+  }
+  localGroup.userData.sheetIndex = activeSheetIndex;
   partsGroup.add(localGroup);
+  cachePartBounds(localGroup);
+  const placed = assignPartToSheet(localGroup, activeSheetIndex, {
+    allowCreateSheet: true,
+    searchAllSheets: true
+  });
+  if (!placed) {
+    clampPartToSheet(localGroup);
+  }
 
   const localBounds = cachePartBounds(localGroup);
   if (localBounds) {
@@ -2603,6 +3427,8 @@ function finalizeImportedGroup(localGroup, autoCenter) {
     updateGlobalBounds();
   }
   updatePieceCountBadge();
+  updateSheetListUi();
+  updateSheetInfoBadge();
   return true;
 }
 
@@ -2896,6 +3722,10 @@ async function importSingleFileBrowserPipeline(
 
 function updateGlobalBounds() {
   bboxAll.makeEmpty();
+  for (const sheetVisual of sheetsGroup.children) {
+    sheetTempBox.setFromObject(sheetVisual);
+    if (!sheetTempBox.isEmpty()) bboxAll.union(sheetTempBox);
+  }
   for (const child of partsGroup.children) {
     const childBounds = getCachedPartBounds(child);
     if (!childBounds) continue;
@@ -2912,10 +3742,7 @@ function fitToScene(padding = 1.25) {
   bboxAll.getCenter(center);
 
   const maxDim = Math.max(size.x, size.y, size.z);
-  const effectiveFovDeg = typeof camera.getEffectiveFOV === "function"
-    ? camera.getEffectiveFOV()
-    : camera.fov;
-  const fov = THREE.MathUtils.degToRad(effectiveFovDeg);
+  const fov = THREE.MathUtils.degToRad(camera.fov);
   const dist = (maxDim / 2) / Math.tan(fov / 2);
 
   const dirVec = new THREE.Vector3(1, 1, 1).normalize();
@@ -2930,43 +3757,31 @@ function fitToScene(padding = 1.25) {
 // ---------------------------
 const fileInput = document.getElementById("fileInput");
 const stepInput = document.getElementById("stepInput");
-const sceneScaleEl = document.getElementById("sceneScale");
-const cameraZoomEl = document.getElementById("cameraZoom");
-const thicknessEl = document.getElementById("thickness");
-const autoCenterEl = document.getElementById("autoCenter");
 const fitBtn = document.getElementById("fitBtn");
 const clearBtn = document.getElementById("clearBtn");
 const pieceCountEl = document.getElementById("pieceCount");
 const batchTimeEl = document.getElementById("batchTime");
 const runtimeModeEl = document.getElementById("runtimeMode");
+const cacheStatsEl = document.getElementById("cacheStats");
 const selectedPieceEl = document.getElementById("selectedPiece");
+const sheetInfoEl = document.getElementById("sheetInfo");
+const sheetListEl = document.getElementById("sheetList");
+const newSheetBtn = document.getElementById("newSheetBtn");
+const editSheetBtn = document.getElementById("editSheetBtn");
+const moveToSheetBtn = document.getElementById("moveToSheetBtn");
+const sheetEditModalEl = document.getElementById("sheetEditModal");
+const applySheetBtn = document.getElementById("applySheetBtn");
+const sheetWidthInput = document.getElementById("sheetW");
+const sheetHeightInput = document.getElementById("sheetH");
+const sheetThicknessInput = document.getElementById("sheetT");
+const sheetMarginTopInput = document.getElementById("sheetMT");
+const sheetMarginBottomInput = document.getElementById("sheetMB");
+const sheetMarginLeftInput = document.getElementById("sheetML");
+const sheetMarginRightInput = document.getElementById("sheetMR");
+const sheetSpacingInput = document.getElementById("sheetS");
 
 if (runtimeModeEl) {
   runtimeModeEl.textContent = "Render: GPU (WebGL)";
-}
-
-function applySceneScale(rawScale) {
-  const scale = THREE.MathUtils.clamp(Number(rawScale) || 1, 0.1, 20);
-  partsGroup.scale.setScalar(scale);
-  refreshAllPartBounds();
-  updateGlobalBounds();
-}
-
-function applyCameraZoom(rawZoom) {
-  const zoom = THREE.MathUtils.clamp(Number(rawZoom) || 1, 0.2, 10);
-  camera.zoom = zoom;
-  camera.updateProjectionMatrix();
-  controls.update();
-}
-
-if (sceneScaleEl) {
-  sceneScaleEl.addEventListener("input", () => applySceneScale(sceneScaleEl.value));
-  applySceneScale(sceneScaleEl.value);
-}
-
-if (cameraZoomEl) {
-  cameraZoomEl.addEventListener("input", () => applyCameraZoom(cameraZoomEl.value));
-  applyCameraZoom(cameraZoomEl.value);
 }
 
 function updatePieceCountBadge() {
@@ -2978,6 +3793,32 @@ function updateBatchTimeBadge(ms) {
   if (!batchTimeEl) return;
   const value = Number.isFinite(ms) ? Math.max(0, Math.round(ms)) : 0;
   batchTimeEl.textContent = `Tempo: ${value} ms`;
+}
+
+function updateCacheStatsBadge(stats = null) {
+  if (!cacheStatsEl) return;
+  if (!stats) {
+    cacheStatsEl.textContent = "Cache: -";
+    return;
+  }
+
+  const meshHits = Number(stats.meshHits || 0);
+  const meshMisses = Number(stats.meshMisses || 0);
+  const meshSaves = Number(stats.meshSaves || 0);
+  const parseHits = Number(stats.parseHits || 0);
+  const parseMisses = Number(stats.parseMisses || 0);
+  const parseSaves = Number(stats.parseSaves || 0);
+  const stepMeshHits = Number(stats.stepMeshHits || 0);
+  const stepMeshMisses = Number(stats.stepMeshMisses || 0);
+  const stepMeshSaves = Number(stats.stepMeshSaves || 0);
+  const errors = Number(stats.errors || 0);
+  const mode = String(stats.mode || "").trim();
+
+  cacheStatsEl.textContent =
+    `Cache DXF M:${meshHits}/${meshMisses}/${meshSaves} P:${parseHits}/${parseMisses}/${parseSaves}` +
+    ` | STEP M:${stepMeshHits}/${stepMeshMisses}/${stepMeshSaves}` +
+    (mode ? ` | Modo:${mode.toUpperCase()}` : "") +
+    (errors > 0 ? ` ERR:${errors}` : "");
 }
 
 function formatPieceLabel(name) {
@@ -2993,9 +3834,147 @@ function updateSelectedPieceBadge(name) {
   selectedPieceEl.textContent = `Peca sel.: ${formatPieceLabel(name)}`;
 }
 
+function updateSheetInfoBadge() {
+  if (!sheetInfoEl) return;
+  const sheetIndex = getValidSheetIndex(activeSheetIndex);
+  if (sheetIndex < 0 || !sheetState[sheetIndex]) {
+    sheetInfoEl.textContent = "Chapa: -";
+    return;
+  }
+  const sheet = sheetState[sheetIndex];
+  const pieces = piecesInSheet(sheetIndex);
+  sheetInfoEl.textContent =
+    `Chapa ${sheetIndex + 1}: ${sheet.width.toFixed(0)} x ${sheet.height.toFixed(0)} mm | ` +
+    `Esp: ${sheet.spacing.toFixed(1)} | Pecas: ${pieces}`;
+}
+
+function updateSheetListUi() {
+  if (!sheetListEl) return;
+  sheetListEl.innerHTML = "";
+  if (sheetState.length === 0) return;
+
+  for (let idx = 0; idx < sheetState.length; idx += 1) {
+    const sheet = sheetState[idx];
+    if (!sheet) continue;
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = `sheet-item${idx === activeSheetIndex ? " active" : ""}`;
+    item.innerHTML =
+      `<span class="sheet-item-title">Chapa ${idx + 1}</span>` +
+      `<span class="sheet-item-meta">${sheet.width.toFixed(0)} x ${sheet.height.toFixed(0)} mm</span>` +
+      `<span class="sheet-item-meta">Pecas: ${piecesInSheet(idx)} | Espacamento: ${sheet.spacing.toFixed(1)} mm</span>`;
+    item.addEventListener("click", () => setActiveSheet(idx));
+    sheetListEl.appendChild(item);
+  }
+}
+
+function fillSheetEditorForm(sheet) {
+  if (!sheet) return;
+  if (sheetWidthInput) sheetWidthInput.value = String(sheet.width.toFixed(2));
+  if (sheetHeightInput) sheetHeightInput.value = String(sheet.height.toFixed(2));
+  if (sheetThicknessInput) sheetThicknessInput.value = String(sheet.thickness.toFixed(2));
+  if (sheetMarginTopInput) sheetMarginTopInput.value = String(sheet.marginTop.toFixed(2));
+  if (sheetMarginBottomInput) sheetMarginBottomInput.value = String(sheet.marginBottom.toFixed(2));
+  if (sheetMarginLeftInput) sheetMarginLeftInput.value = String(sheet.marginLeft.toFixed(2));
+  if (sheetMarginRightInput) sheetMarginRightInput.value = String(sheet.marginRight.toFixed(2));
+  if (sheetSpacingInput) sheetSpacingInput.value = String(sheet.spacing.toFixed(2));
+}
+
+function closeSheetEditorModal() {
+  if (sheetEditModalEl) sheetEditModalEl.classList.add("hidden");
+}
+
+function openSheetEditorModal() {
+  const sheetIndex = getValidSheetIndex(activeSheetIndex);
+  if (sheetIndex < 0) return;
+  fillSheetEditorForm(sheetState[sheetIndex]);
+  if (sheetEditModalEl) sheetEditModalEl.classList.remove("hidden");
+}
+window.__openSheetEditorModal = openSheetEditorModal;
+
+function readSheetEditorForm() {
+  return normalizeSheetConfig({
+    width: Number(sheetWidthInput?.value),
+    height: Number(sheetHeightInput?.value),
+    thickness: Number(sheetThicknessInput?.value),
+    marginTop: Number(sheetMarginTopInput?.value),
+    marginBottom: Number(sheetMarginBottomInput?.value),
+    marginLeft: Number(sheetMarginLeftInput?.value),
+    marginRight: Number(sheetMarginRightInput?.value),
+    spacing: Number(sheetSpacingInput?.value)
+  }, DEFAULT_SHEET_CONFIG);
+}
+
+if (newSheetBtn) {
+  newSheetBtn.addEventListener("click", () => {
+    const source = sheetState[getValidSheetIndex(activeSheetIndex)] || DEFAULT_SHEET_CONFIG;
+    sheetState.push(createSheetFrom(source));
+    syncSheetsOrigins({ preservePartPositions: true });
+    setActiveSheet(sheetState.length - 1);
+    updateGlobalBounds();
+  });
+}
+
+if (editSheetBtn) {
+  editSheetBtn.addEventListener("click", () => openSheetEditorModal());
+}
+
+if (moveToSheetBtn) {
+  moveToSheetBtn.addEventListener("click", () => {
+    if (!selectedPart) return;
+    const moved = assignPartToSheet(selectedPart, activeSheetIndex, {
+      allowCreateSheet: true,
+      searchAllSheets: false
+    });
+    if (moved) {
+      updateGlobalBounds();
+      updateSheetListUi();
+      updateSheetInfoBadge();
+    }
+  });
+}
+
+if (sheetEditModalEl) {
+  sheetEditModalEl.addEventListener("click", (event) => {
+    if (event.target === sheetEditModalEl) closeSheetEditorModal();
+  });
+}
+
+if (applySheetBtn) {
+  applySheetBtn.addEventListener("click", () => {
+    const sheetIndex = getValidSheetIndex(activeSheetIndex);
+    if (sheetIndex < 0) return;
+    const updated = readSheetEditorForm();
+    sheetState[sheetIndex] = {
+      ...sheetState[sheetIndex],
+      ...updated
+    };
+    syncSheetsOrigins({ preservePartPositions: true });
+    rebuildSheetsVisuals();
+    relayoutSheetPieces(sheetIndex);
+    closeSheetEditorModal();
+    updateGlobalBounds();
+    updateSheetListUi();
+    updateSheetInfoBadge();
+    fitToScene(1.15);
+  });
+}
+
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && sheetEditModalEl && !sheetEditModalEl.classList.contains("hidden")) {
+    closeSheetEditorModal();
+  }
+});
+
 updatePieceCountBadge();
 updateBatchTimeBadge(0);
+updateCacheStatsBadge(null);
 updateSelectedPieceBadge(null);
+ensureInitialSheet();
+updateSheetListUi();
+updateSheetInfoBadge();
+updateGlobalBounds();
+fitToScene(1.18);
 
 function decodeDxfArrayBuffer(arrayBuffer, filename = "") {
   let text = "";
@@ -3107,7 +4086,7 @@ async function importStepViaPython(stepText, filename = "arquivo.step") {
     if (!response.ok) {
       return {
         ok: false,
-        error: `Endpoint STEP indisponivel (HTTP ${response.status}). Rode: python run_server.py`
+        error: `Endpoint STEP indisponivel (HTTP ${response.status}). Rode: py -3.9 run_server.py`
       };
     }
 
@@ -3126,7 +4105,7 @@ async function importStepViaPython(stepText, filename = "arquivo.step") {
       ok: false,
       error: isAbort
         ? "Timeout ao processar STEP no servidor local."
-        : "Falha de conexao com o servidor STEP. Rode: python run_server.py"
+        : "Falha de conexao com o servidor STEP. Rode: py -3.9 run_server.py"
     };
   } finally {
     if (timeoutId) window.clearTimeout(timeoutId);
@@ -3164,9 +4143,12 @@ function buildGroupFromStepPayload(payload, filename = "arquivo.step") {
 async function importSingleStepFilePythonPipeline(
   file,
   autoCenter = true,
-  onIssue = null
+  onIssue = null,
+  onCacheEvent = null
 ) {
   let fileBuffer = null;
+  let stepHash = "";
+  let meshCacheKey = "";
 
   try {
     fileBuffer = await file.arrayBuffer();
@@ -3174,6 +4156,22 @@ async function importSingleStepFilePythonPipeline(
     console.error("Falha ao ler arquivo STEP:", file?.name, readError);
     reportImportIssue(onIssue, `Falha ao ler ${file?.name || "arquivo STEP"}.`);
     return false;
+  }
+
+  try {
+    stepHash = await computeArrayBufferHashHex(fileBuffer);
+    meshCacheKey = buildStepMeshCacheKeyFromHash(stepHash);
+  } catch (_hashError) {
+    meshCacheKey = "";
+  }
+
+  if (meshCacheKey) {
+    const cachedGroup = await getMeshGroupFromPersistentCache(meshCacheKey, file?.name || "");
+    if (cachedGroup) {
+      if (typeof onCacheEvent === "function") onCacheEvent({ type: "step-mesh-hit", fileName: file?.name || "" });
+      return finalizeImportedGroup(cachedGroup, autoCenter);
+    }
+    if (typeof onCacheEvent === "function") onCacheEvent({ type: "step-mesh-miss", fileName: file?.name || "" });
   }
 
   const stepText = decodeStepArrayBuffer(fileBuffer, file?.name || "");
@@ -3189,6 +4187,13 @@ async function importSingleStepFilePythonPipeline(
     return false;
   }
 
+  if (meshCacheKey) {
+    const persistedMesh = await putMeshGroupInPersistentCache(meshCacheKey, localGroup, file, 0);
+    if (typeof onCacheEvent === "function") {
+      onCacheEvent({ type: persistedMesh ? "step-mesh-save" : "step-mesh-save-failed", fileName: file?.name || "" });
+    }
+  }
+
   return finalizeImportedGroup(localGroup, autoCenter);
 }
 
@@ -3197,13 +4202,14 @@ fileInput.addEventListener("change", async (ev) => {
   if (files.length === 0) return;
 
   const importStart = performance.now();
-  const thickness = Number(thicknessEl.value || 5);
-  const autoCenter = !!autoCenterEl.checked;
+  const thickness = DEFAULT_PART_THICKNESS;
+  const autoCenter = DEFAULT_AUTO_CENTER;
   const importIssues = [];
   let importedCount = 0;
   const workerPool = getDxfWorkerPool();
+  updateCacheStatsBadge({ mode: "browser" });
 
-  await runWithConcurrency(files, DXF_IMPORT_CONCURRENCY, async (f) => {
+  await runWithConcurrency(files, DXF_PARSE_WORKERS, async (f) => {
     try {
       const ok = await importSingleFileBrowserPipeline(
         f,
@@ -3252,16 +4258,37 @@ if (stepInput) {
     if (files.length === 0) return;
 
     const importStart = performance.now();
-    const autoCenter = !!autoCenterEl.checked;
+    const autoCenter = DEFAULT_AUTO_CENTER;
     const importIssues = [];
+    const cacheStats = {
+      meshHits: 0,
+      meshMisses: 0,
+      meshSaves: 0,
+      parseHits: 0,
+      parseMisses: 0,
+      parseSaves: 0,
+      stepMeshHits: 0,
+      stepMeshMisses: 0,
+      stepMeshSaves: 0,
+      errors: 0
+    };
     let importedCount = 0;
+    updateCacheStatsBadge(cacheStats);
 
     await Promise.all(files.map(async (f) => {
       try {
         const ok = await importSingleStepFilePythonPipeline(
           f,
           autoCenter,
-          (msg) => importIssues.push(msg)
+          (msg) => importIssues.push(msg),
+          (event) => {
+            const type = String(event?.type || "");
+            if (type === "step-mesh-hit") cacheStats.stepMeshHits += 1;
+            else if (type === "step-mesh-miss") cacheStats.stepMeshMisses += 1;
+            else if (type === "step-mesh-save") cacheStats.stepMeshSaves += 1;
+            else if (type.endsWith("-failed")) cacheStats.errors += 1;
+            updateCacheStatsBadge(cacheStats);
+          }
         );
         if (ok) importedCount += 1;
       } catch (error) {
@@ -3312,6 +4339,8 @@ clearBtn.addEventListener("click", () => {
   }
   updateGlobalBounds();
   updatePieceCountBadge();
+  updateSheetListUi();
+  updateSheetInfoBadge();
 });
 
 window.addEventListener("beforeunload", () => {

@@ -612,6 +612,14 @@ def parse_step_text_to_stl_base64(text: str, filename: str = "arquivo.step") -> 
 
 
 class ViewerHandler(SimpleHTTPRequestHandler):
+    def end_headers(self) -> None:  # noqa: D401
+        # Evita cache agressivo no navegador para garantir que o frontend carregue
+        # sempre a versao mais recente dos arquivos locais durante desenvolvimento.
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        super().end_headers()
+
     def _send_json(self, payload: dict[str, Any], status: int = 200) -> None:
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -619,6 +627,17 @@ class ViewerHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
+
+    def do_GET(self) -> None:  # noqa: N802
+        # Remove validadores condicionais para evitar respostas 304 com assets antigos.
+        try:
+            if "If-Modified-Since" in self.headers:
+                del self.headers["If-Modified-Since"]
+            if "If-None-Match" in self.headers:
+                del self.headers["If-None-Match"]
+        except Exception:
+            pass
+        super().do_GET()
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.send_response(204)
@@ -687,7 +706,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="DXF/STEP 3D viewer server (static + Python parse APIs)")
     parser.add_argument("--host", default="127.0.0.1", help="Host para bind (padrao: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=5173, help="Porta HTTP (padrao: 5173)")
-    parser.add_argument("--dir", default=".", help="Diretorio raiz de arquivos estaticos")
+    parser.add_argument(
+        "--dir",
+        default=str(Path(__file__).resolve().parent),
+        help="Diretorio raiz de arquivos estaticos",
+    )
     args = parser.parse_args()
 
     root = Path(args.dir).resolve()
@@ -695,6 +718,7 @@ def main() -> None:
     server = ThreadingHTTPServer((args.host, args.port), handler)
 
     print(f"Servidor ativo em http://{args.host}:{args.port}")
+    print(f"Diretorio servido: {root}")
     print("API DXF Python: POST /api/parse-dxf")
     if CUDA_AVAILABLE:
         print(f"DXF CUDA: disponivel ({CUDA_PATH_DETECTED or 'CUDA_PATH'})")

@@ -27,43 +27,89 @@
         <input id="stepInput" type="file" accept=".step,.stp,.STEP,.STP" multiple hidden />
       </label>
 
-      <button id="fitBtn" class="btn secondary">Enquadrar (Fit)</button>
-      <button id="clearBtn" class="btn danger">Limpar</button>
+      <button id="fitBtn" type="button" class="btn secondary">Enquadrar (Fit)</button>
+      <button id="clearBtn" type="button" class="btn danger">Limpar</button>
+      <button id="newSheetBtn" type="button" class="btn secondary">Nova chapa</button>
+      <button id="editSheetBtn" type="button" class="btn secondary">Editar chapa</button>
+      <button id="moveToSheetBtn" type="button" class="btn secondary">Mover para chapa</button>
+      <span id="sheetInfo" class="counter">Chapa: -</span>
       <span id="pieceCount" class="counter">Pecas: 0</span>
       <span id="batchTime" class="counter">Tempo: 0 ms</span>
       <span id="runtimeMode" class="counter">Render: GPU (WebGL)</span>
+      <span id="cacheStats" class="counter">Cache: -</span>
       <span id="selectedPiece" class="counter">Peca sel.: -</span>
     </div>
 
-    <div class="right">
-      <label class="row">
-        Escala da cena
-        <input id="sceneScale" type="number" value="1" min="0.1" max="20" step="0.1" />
-      </label>
+  </div>
 
-      <label class="row">
-        Zoom da camera
-        <input id="cameraZoom" type="number" value="1" min="0.2" max="10" step="0.1" />
-      </label>
-
-      <label class="row">
-        Espessura (Z)
-        <input id="thickness" type="number" value="5" min="0.1" step="0.1" />
-      </label>
-
-      <label class="row">
-        Centro automatico
-        <input id="autoCenter" type="checkbox" checked />
-      </label>
+  <div id="workspace">
+    <aside id="sheetDock">
+      <div class="sheet-dock-head">
+        <div class="sheet-dock-title">Chapas</div>
+        <div class="sheet-dock-sub">Clique para ativar</div>
+      </div>
+      <div id="sheetList" class="sheet-list"></div>
+    </aside>
+    <div id="viewportWrap">
+      <div id="viewport"></div>
     </div>
   </div>
 
-  <div id="viewport"></div>
-
   <div id="help">
-    Mouse: <b>Esq</b> orbitar | <b>Meio</b> zoom | <b>Dir</b> pan
+    Mouse: <b>Esq</b> orbitar | <b>Meio</b> zoom | <b>Dir</b> pan | <b>Delete</b> remove peca
   </div>
 
-  <script type="module" src="./app.js?v=gpu-only-1"></script>
+  <div id="sheetEditModal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-title">Editar chapa ativa</div>
+      <div class="modal-grid">
+        <label class="field">Largura (mm)
+          <input id="sheetW" type="number" min="10" step="1" value="3000" />
+        </label>
+        <label class="field">Altura (mm)
+          <input id="sheetH" type="number" min="10" step="1" value="1200" />
+        </label>
+        <label class="field">Espessura (mm)
+          <input id="sheetT" type="number" min="0.1" step="0.1" value="1" />
+        </label>
+        <label class="field">Espacamento (mm)
+          <input id="sheetS" type="number" min="0" step="0.1" value="5" />
+        </label>
+        <label class="field">Margem superior (mm)
+          <input id="sheetMT" type="number" min="0" step="0.1" value="10" />
+        </label>
+        <label class="field">Margem inferior (mm)
+          <input id="sheetMB" type="number" min="0" step="0.1" value="10" />
+        </label>
+        <label class="field">Margem esquerda (mm)
+          <input id="sheetML" type="number" min="0" step="0.1" value="10" />
+        </label>
+        <label class="field">Margem direita (mm)
+          <input id="sheetMR" type="number" min="0" step="0.1" value="10" />
+        </label>
+      </div>
+      <div class="modal-actions">
+        <button id="applySheetBtn" type="button" class="btn">Aplicar</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    (() => {
+      const editBtn = document.getElementById("editSheetBtn");
+      const modal = document.getElementById("sheetEditModal");
+      if (!editBtn || !modal) return;
+
+      editBtn.addEventListener("click", () => {
+        if (typeof window.__openSheetEditorModal === "function") {
+          window.__openSheetEditorModal();
+          return;
+        }
+        modal.classList.remove("hidden");
+      });
+    })();
+  </script>
+
+  <script type="module" src="./app.js?v=layoutSheets2-gpuonly-editfix3"></script>
 </body>
 </html>

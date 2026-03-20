@@ -1,100 +1,113 @@
-# DXFs 3D
+# DXFs 3D Viewer com Layout por Chapas
 
-Visualizador 3D para DXF e STEP/STP.
+Visualizador 3D para DXF e STEP/STP com fluxo de nesting manual em chapas, com DXF em modo browser/WebGL (GPU) e sem seletor CPU no frontend.
 
 ## Objetivo do projeto
 
-Renderizar pecas CAD em 3D no navegador com foco em performance visual:
+Permitir importacao e visualizacao 3D de pecas DXF/STEP com um layout de producao orientado a chapas CNC:
 
-- `Three.js` para renderizacao WebGL (GPU).
-- parser DXF em JavaScript para leitura/conversao do arquivo.
-- sem cache persistente de pecas no frontend.
+- criar multiplas chapas
+- selecionar chapa ativa
+- posicionar pecas automaticamente dentro da area util da chapa
+- mover pecas para outra chapa sem sair dos limites configurados
 
 ## Arquitetura do sistema
 
-### Frontend
+### Frontend (browser)
 
-- `index.html`: estrutura da interface.
-- `styles.css`: estilos da UI.
-- `app.js`: pipeline de importacao e renderizacao.
-- `dxf-worker.js`: parse DXF em worker para nao travar a thread principal.
-
-Fluxo DXF:
-
-1. Leitura do arquivo no browser.
-2. Parse/conversao para contornos.
-3. Geracao de malha 3D.
-4. Renderizacao via WebGL.
+- `index.html`: estrutura da tela (toolbar, dock de chapas, viewport 3D, modal de edicao de chapa)
+- `styles.css`: tema e layout responsivo
+- `app.js`: renderizacao Three.js, importacao DXF browser-only, importacao STEP, selecao/transform, estado de chapas
+- `sheet-layout.js`: funcoes puras de layout (origem de chapas, area util, encaixe sem colisao)
+- `dxf-worker.js`: parse DXF em paralelo no browser
 
 ### Backend local (Python)
 
-- `run_server.py` / `server.py`: servidor HTTP local e endpoint STEP.
-- `POST /api/parse-step`: converte STEP/STP para STL para exibicao no frontend.
+- `server.py`: servidor HTTP para arquivos estaticos e APIs de parse
+- `run_server.py`: ponto de entrada simples para subir o servidor
+
+### Testes
+
+- `tests/sheet-layout.test.mjs`: testes automatizados das regras de layout de chapas
 
 ## Dependencias necessarias
 
 ### Python
 
 - Python 3.12 (recomendado)
-- `ezdxf==1.4.2` (requirements.txt)
+- `ezdxf==1.4.2` (obrigatorio para DXF)
+- `cadquery` (opcional, necessario para STEP/STP)
+- `cupy-cuda12x` (opcional, apenas para uso direto no backend Python)
 
-### Opcionais
+### Node.js (somente para testes)
 
-- `cadquery` para importacao STEP/STP.
-
-### Frontend (CDN)
-
-- `three@0.160.0`
-- `dxf-parser@1.1.2`
+- Node.js 18+ (usado para `node --test`)
 
 ## Instalacao
+
+No PowerShell, dentro da pasta do projeto:
 
 ```powershell
 cd C:\Users\USER\Downloads\Ver_DXF\dxf-3d-viewer-main
 py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install cadquery
 ```
 
 ## Execucao
 
+### Servidor completo (DXF + STEP + APIs)
+
 ```powershell
 cd C:\Users\USER\Downloads\Ver_DXF\dxf-3d-viewer-main
-.\.venv\Scripts\Activate.ps1
-python run_server.py
+.\.venv\Scripts\python.exe .\run_server.py
 ```
 
-Abra:
+Abra no navegador:
 
 - `http://127.0.0.1:5173`
 
-## Exemplo de uso
+### Execucao direta do servidor
 
-1. Clique em `Importar DXF(s)` e selecione um ou mais arquivos.
-2. Ajuste `Espessura (Z)` se necessario.
-3. Use `Escala da cena` para escalar o conjunto inteiro.
-4. Use `Zoom da camera` para aproximar/afastar sem recriar a geometria.
-5. Clique em `Enquadrar (Fit)` para recentralizar a visao.
+```powershell
+.\.venv\Scripts\python.exe .\server.py --host 127.0.0.1 --port 5173 --dir .
+```
+
+## Como usar (exemplo rapido)
+
+1. Clique em `Importar DXF(s)` ou `Importar STEP(s)`.
+2. Use `Nova chapa` para criar outra chapa.
+3. Clique em uma chapa no painel lateral para ativar.
+4. Use `Mover para chapa` para enviar a peca selecionada para a chapa ativa.
+5. Use `Editar chapa` para ajustar largura, altura, margens e espacamento.
+6. Clique em `Enquadrar (Fit)` para centralizar a visualizacao.
 
 ## Principais modulos/funcoes
 
-- `importSingleFileBrowserPipeline(...)`: importa DXF no navegador (sem cache de pecas).
-- `addDxfToScene(...)`: converte os contornos em malha Three.js.
-- `applySceneScale(...)`: escala o container de pecas via transformacao.
-- `applyCameraZoom(...)`: ajusta zoom da camera via matriz/projecao.
-- `fitToScene(...)`: enquadra o volume total das pecas na camera.
+- `assignPartToSheet` (`app.js`): aloca peca em chapa com fallback para nova chapa
+- `relayoutSheetPieces` (`app.js`): reorganiza pecas apos alterar parametros da chapa
+- `findPlacementOnSheet` (`sheet-layout.js`): calcula primeira posicao valida sem colisao
+- `getSheetUsableBounds` (`sheet-layout.js`): calcula area util com margens
 
-## Estrutura de diretorios
+## Testes automatizados
 
-```text
-dxf-3d-viewer-main/
-  app.js
-  dxf-worker.js
-  index.html
-  styles.css
-  server.py
-  run_server.py
-  requirements.txt
-  README.md
+Executar:
+
+```powershell
+npm test
 ```
+
+Cobertura atual dos testes:
+
+- normalizacao de configuracao da chapa
+- calculo de origem entre chapas
+- calculo de area util
+- deteccao de colisao com espacamento
+- busca de posicao valida para encaixe
+- falha esperada quando a peca nao cabe
+
+## Endpoints locais
+
+- `POST /api/parse-dxf`
+- `POST /api/parse-step`
