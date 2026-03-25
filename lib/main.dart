@@ -1741,8 +1741,10 @@ class ViewportPainter extends CustomPainter {
           }
         } else {
           final outer = _outerContour(piece.dxfGeometry!);
+          List<Offset>? contourFront;
+          List<Offset>? contourBack;
           if (outer != null && outer.length >= 3) {
-            final contourFront = _projectContourOnPiece(
+            contourFront = _projectContourOnPiece(
               outer,
               piece,
               rect,
@@ -1750,17 +1752,7 @@ class ViewportPainter extends CustomPainter {
               pieceFrontZ,
               size,
             );
-            if (contourFront != null) {
-              drawPoly(
-                canvas,
-                contourFront,
-                fill: piece.color.withValues(alpha: isActive ? 0.24 : 0.16),
-                stroke: selected ? const Color(0xFFFFE875) : piece.color,
-                strokeWidth: selected ? 2.0 : 1.1,
-              );
-            }
-
-            final contourBack = _projectContourOnPiece(
+            contourBack = _projectContourOnPiece(
               outer,
               piece,
               rect,
@@ -1768,40 +1760,59 @@ class ViewportPainter extends CustomPainter {
               pieceBackZ,
               size,
             );
-            if (contourBack != null) {
-              drawPoly(
-                canvas,
-                contourBack,
-                stroke: selected
-                    ? const Color(0xFFFFE875).withValues(alpha: 0.82)
-                    : piece.color.withValues(alpha: 0.82),
-                strokeWidth: selected ? 1.6 : 1.0,
-              );
-            }
+          } else {
+            contourFront = _projectPolygon3d([
+              Vec3(rect.left + sheetOffsetX, rect.bottom, pieceFrontZ),
+              Vec3(rect.right + sheetOffsetX, rect.bottom, pieceFrontZ),
+              Vec3(rect.right + sheetOffsetX, rect.top, pieceFrontZ),
+              Vec3(rect.left + sheetOffsetX, rect.top, pieceFrontZ),
+            ], size);
+            contourBack = _projectPolygon3d([
+              Vec3(rect.left + sheetOffsetX, rect.bottom, pieceBackZ),
+              Vec3(rect.right + sheetOffsetX, rect.bottom, pieceBackZ),
+              Vec3(rect.right + sheetOffsetX, rect.top, pieceBackZ),
+              Vec3(rect.left + sheetOffsetX, rect.top, pieceBackZ),
+            ], size);
+          }
 
-            if (contourFront != null && contourBack != null) {
-              final sidePaint = Paint()
-                ..style = PaintingStyle.stroke
-                ..strokeWidth = 0.9
-                ..color = piece.color.withValues(alpha: 0.70);
-              final count = min(contourFront.length, contourBack.length);
-              for (var pIdx = 0; pIdx < count; pIdx++) {
-                canvas.drawLine(
-                  contourFront[pIdx],
-                  contourBack[pIdx],
-                  sidePaint,
-                );
-              }
+          if (contourFront != null) {
+            drawPoly(
+              canvas,
+              contourFront,
+              fill: piece.color.withValues(alpha: isActive ? 0.30 : 0.22),
+              stroke: selected ? const Color(0xFFFFE875) : piece.color,
+              strokeWidth: selected ? 2.0 : 1.1,
+            );
+          }
+          if (contourBack != null) {
+            drawPoly(
+              canvas,
+              contourBack,
+              stroke: selected
+                  ? const Color(0xFFFFE875).withValues(alpha: 0.90)
+                  : piece.color.withValues(alpha: 0.90),
+              strokeWidth: selected ? 1.6 : 1.0,
+            );
+          }
+          if (contourFront != null && contourBack != null) {
+            final sidePaint = Paint()
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = 0.95
+              ..color = piece.color.withValues(alpha: 0.78);
+            final count = min(contourFront.length, contourBack.length);
+            for (var pIdx = 0; pIdx < count; pIdx++) {
+              canvas.drawLine(contourFront[pIdx], contourBack[pIdx], sidePaint);
             }
           }
         }
-        _drawPieceGeometry3d(
+        _drawPieceGeometry3dExtruded(
           canvas,
           piece,
           rect,
           selected,
           size,
           pieceFrontZ + 0.03,
+          pieceBackZ + 0.03,
           sheetOffsetX,
         );
       }
@@ -1921,47 +1932,101 @@ class ViewportPainter extends CustomPainter {
     }
   }
 
-  void _drawPieceGeometry3d(
+  void _drawPieceGeometry3dExtruded(
     Canvas canvas,
     PlacedPiece piece,
     Rect rect,
     bool selected,
     Size size,
-    double z,
+    double zFront,
+    double zBack,
     double offsetX,
   ) {
     final geo = piece.dxfGeometry;
     if (geo == null || geo.polylines.isEmpty) return;
 
-    final paint = Paint()
+    final frontPaint = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = selected ? 1.6 : 1.1
       ..color = selected ? const Color(0xFFFFF5A2) : piece.color;
+    final backPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = selected ? 1.3 : 0.95
+      ..color = (selected ? const Color(0xFFFFF5A2) : piece.color).withValues(
+        alpha: 0.90,
+      );
+    final sidePaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 0.85
+      ..color = piece.color.withValues(alpha: 0.78);
 
     for (final poly in geo.polylines) {
       if (poly.points.length < 2) continue;
-      final path = Path();
-      var hasSegment = false;
+      final frontPath = Path();
+      final backPath = Path();
+      final frontPts = <Offset?>[];
+      final backPts = <Offset?>[];
+      var hasFrontSegment = false;
+      var hasBackSegment = false;
       for (var i = 0; i < poly.points.length; i++) {
         final world = _geometryPointToWorld(poly.points[i], piece, rect, geo);
-        final screen = project3dSafe(
-          Vec3(world.dx + offsetX, world.dy, z),
+        final front = project3dSafe(
+          Vec3(world.dx + offsetX, world.dy, zFront),
           size,
         );
-        if (screen == null) {
-          hasSegment = false;
-          continue;
-        }
-        if (!hasSegment) {
-          path.moveTo(screen.dx, screen.dy);
-          hasSegment = true;
+        final back = project3dSafe(
+          Vec3(world.dx + offsetX, world.dy, zBack),
+          size,
+        );
+
+        frontPts.add(front);
+        backPts.add(back);
+
+        if (front == null) {
+          hasFrontSegment = false;
+        } else if (!hasFrontSegment) {
+          frontPath.moveTo(front.dx, front.dy);
+          hasFrontSegment = true;
         } else {
-          path.lineTo(screen.dx, screen.dy);
+          frontPath.lineTo(front.dx, front.dy);
+        }
+
+        if (back == null) {
+          hasBackSegment = false;
+        } else if (!hasBackSegment) {
+          backPath.moveTo(back.dx, back.dy);
+          hasBackSegment = true;
+        } else {
+          backPath.lineTo(back.dx, back.dy);
         }
       }
-      if (!hasSegment) continue;
-      if (poly.closed) path.close();
-      canvas.drawPath(path, paint);
+      if (!hasFrontSegment && !hasBackSegment) continue;
+
+      if (poly.closed) {
+        frontPath.close();
+        backPath.close();
+      }
+      canvas.drawPath(frontPath, frontPaint);
+      canvas.drawPath(backPath, backPaint);
+
+      if (poly.closed) {
+        final targetConnectors = 72;
+        final step = max(1, poly.points.length ~/ targetConnectors);
+        for (var i = 0; i < poly.points.length; i += step) {
+          final f = frontPts[i];
+          final b = backPts[i];
+          if (f != null && b != null) {
+            canvas.drawLine(f, b, sidePaint);
+          }
+        }
+      } else {
+        final ff = frontPts.isNotEmpty ? frontPts.first : null;
+        final fb = backPts.isNotEmpty ? backPts.first : null;
+        if (ff != null && fb != null) canvas.drawLine(ff, fb, sidePaint);
+        final lf = frontPts.isNotEmpty ? frontPts.last : null;
+        final lb = backPts.isNotEmpty ? backPts.last : null;
+        if (lf != null && lb != null) canvas.drawLine(lf, lb, sidePaint);
+      }
     }
   }
 
